@@ -2,6 +2,27 @@ const express = require('express');
 const router = express.Router();
 const db = require('../db');
 const { isAdmin } = require('../middleware/auth');
+const OpenAI = require('openai');
+
+// Initialize OpenAI client
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
+
+// Get embedding from OpenAI using text-embedding-3-small model
+async function getEmbedding(text) {
+  try {
+    const response = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: text,
+      dimensions: 1536
+    });
+    return response.data[0].embedding;
+  } catch (err) {
+    console.error('Error getting embedding:', err);
+    return null;
+  }
+}
 
 // Apply admin middleware to all routes
 router.use(isAdmin);
@@ -91,7 +112,7 @@ router.get('/proverbs/:id/edit', async (req, res) => {
   }
 });
 
-// Create proverb
+// Create proverb (single)
 router.post('/proverbs', async (req, res) => {
   const { chapter, verse, text } = req.body;
 
@@ -109,15 +130,83 @@ router.post('/proverbs', async (req, res) => {
   }
 });
 
-// Update proverb
+// Create proverbs in bulk with embeddings
+router.post('/proverbs/bulk', async (req, res) => {
+  const { chapter, verses } = req.body;
+  const chapterNum = parseInt(chapter);
+
+  if (!chapter || !verses) {
+    return res.status(400).send('Chapter and verses are required');
+  }
+
+  try {
+    // Split verses by newlines, each line is a verse
+    const lines = verses.split('\n');
+    let savedCount = 0;
+    let errorCount = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const text = lines[i].trim();
+      const verseNum = i + 1; // Line number = verse number (1-indexed)
+
+      // Skip empty lines
+      if (!text) continue;
+
+      try {
+        // Get vector embedding from OpenAI
+        const vector = await getEmbedding(text);
+
+        if (vector) {
+          // Insert with vector
+          await db.query(
+            `INSERT INTO proverbs (chapter, verse, text, vector)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (chapter, verse) DO UPDATE SET text = $3, vector = $4, updated_at = NOW()`,
+            [chapterNum, verseNum, text, JSON.stringify(vector)]
+          );
+        } else {
+          // Insert without vector if embedding failed
+          await db.query(
+            `INSERT INTO proverbs (chapter, verse, text)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (chapter, verse) DO UPDATE SET text = $3, updated_at = NOW()`,
+            [chapterNum, verseNum, text]
+          );
+        }
+        savedCount++;
+      } catch (verseErr) {
+        console.error(`Error saving verse ${verseNum}:`, verseErr);
+        errorCount++;
+      }
+    }
+
+    console.log(`Bulk save: ${savedCount} verses saved, ${errorCount} errors for chapter ${chapterNum}`);
+    res.redirect('/admin/proverbs');
+  } catch (err) {
+    console.error('Error in bulk save:', err);
+    res.status(500).send('Error saving proverbs');
+  }
+});
+
+// Update proverb (regenerates embedding)
 router.post('/proverbs/:id', async (req, res) => {
   const { chapter, verse, text } = req.body;
 
   try {
-    await db.query(
-      'UPDATE proverbs SET chapter = $1, verse = $2, text = $3, updated_at = NOW() WHERE id = $4',
-      [parseInt(chapter), parseInt(verse), text, req.params.id]
-    );
+    // Get new embedding for updated text
+    const vector = await getEmbedding(text);
+
+    if (vector) {
+      await db.query(
+        'UPDATE proverbs SET chapter = $1, verse = $2, text = $3, vector = $4, updated_at = NOW() WHERE id = $5',
+        [parseInt(chapter), parseInt(verse), text, JSON.stringify(vector), req.params.id]
+      );
+    } else {
+      await db.query(
+        'UPDATE proverbs SET chapter = $1, verse = $2, text = $3, updated_at = NOW() WHERE id = $4',
+        [parseInt(chapter), parseInt(verse), text, req.params.id]
+      );
+    }
     res.redirect('/admin/proverbs');
   } catch (err) {
     console.error(err);
@@ -324,16 +413,19 @@ function generateProverbsPage(user, proverbs) {
   `;
 }
 
-// Proverb form HTML
+// Proverb form HTML (for editing single proverb)
 function generateProverbForm(user, proverb) {
   const isEdit = !!proverb;
-  return `
+
+  // If editing, show single proverb edit form
+  if (isEdit) {
+    return `
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${isEdit ? 'Edit' : 'New'} Proverb - Admin - Proverbs</title>
+  <title>Edit Proverb - Admin - Proverbs</title>
   <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
@@ -351,27 +443,112 @@ function generateProverbForm(user, proverb) {
   </nav>
 
   <main class="container admin-container">
-    <h1>${isEdit ? 'Edit' : 'New'} Proverb</h1>
+    <h1>Edit Proverb</h1>
 
-    <form action="/admin/proverbs${isEdit ? '/' + proverb.id : ''}" method="POST" class="form">
+    <form action="/admin/proverbs/${proverb.id}" method="POST" class="form">
       <div class="form-row">
         <div class="form-group">
           <label for="chapter">Chapter</label>
-          <input type="number" id="chapter" name="chapter" min="1" max="31" required value="${isEdit ? proverb.chapter : ''}">
+          <input type="number" id="chapter" name="chapter" min="1" max="31" required value="${proverb.chapter}">
         </div>
         <div class="form-group">
           <label for="verse">Verse</label>
-          <input type="number" id="verse" name="verse" min="1" required value="${isEdit ? proverb.verse : ''}">
+          <input type="number" id="verse" name="verse" min="1" required value="${proverb.verse}">
         </div>
       </div>
 
       <div class="form-group">
         <label for="text">Text</label>
-        <textarea id="text" name="text" rows="4" required>${isEdit ? proverb.text : ''}</textarea>
+        <textarea id="text" name="text" rows="4" required>${proverb.text}</textarea>
       </div>
 
       <div class="form-actions">
-        <button type="submit" class="btn btn-primary">${isEdit ? 'Update' : 'Create'} Proverb</button>
+        <button type="submit" class="btn btn-primary">Update Proverb</button>
+        <a href="/admin/proverbs" class="btn btn-outline">Cancel</a>
+      </div>
+    </form>
+  </main>
+</body>
+</html>
+    `;
+  }
+
+  // For new proverbs, show bulk entry form
+  const chapterOptions = Array.from({length: 31}, (_, i) => i + 1)
+    .map(n => `<option value="${n}">Chapter ${n}</option>`)
+    .join('');
+
+  return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Add Proverbs - Admin - Proverbs</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <style>
+    .help-text {
+      font-size: 0.875rem;
+      color: var(--text-secondary, #666);
+      margin-top: 0.5rem;
+    }
+    .verses-textarea {
+      font-family: monospace;
+      line-height: 1.6;
+    }
+    .info-box {
+      background: var(--bg-secondary, #f5f5f5);
+      border-left: 4px solid var(--primary, #007bff);
+      padding: 1rem;
+      margin-bottom: 1.5rem;
+      border-radius: 0 4px 4px 0;
+    }
+  </style>
+</head>
+<body>
+  <nav class="navbar navbar-admin">
+    <div class="nav-brand">
+      <a href="/">Proverbs</a>
+      <span class="badge">Admin</span>
+    </div>
+    <div class="nav-links">
+      <a href="/admin">Dashboard</a>
+      <a href="/admin/users">Users</a>
+      <a href="/admin/proverbs" class="active">Proverbs</a>
+      <a href="/auth/logout" class="btn btn-outline">Logout</a>
+    </div>
+  </nav>
+
+  <main class="container admin-container">
+    <h1>Add Proverbs</h1>
+
+    <div class="info-box">
+      <strong>Bulk Entry Mode:</strong> Enter multiple verses at once. Each line becomes a separate verse,
+      with the line number determining the verse number. Empty lines are skipped.
+      Vector embeddings will be generated automatically for each verse.
+    </div>
+
+    <form action="/admin/proverbs/bulk" method="POST" class="form">
+      <div class="form-group">
+        <label for="chapter">Chapter</label>
+        <select id="chapter" name="chapter" required>
+          <option value="">Select a chapter...</option>
+          ${chapterOptions}
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label for="verses">Verses</label>
+        <textarea id="verses" name="verses" rows="20" class="verses-textarea" required
+          placeholder="Line 1 = Verse 1&#10;Line 2 = Verse 2&#10;Line 3 = Verse 3&#10;..."></textarea>
+        <p class="help-text">
+          Enter one verse per line. The line number corresponds to the verse number.
+          Leave a line blank to skip that verse number.
+        </p>
+      </div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Save Proverbs</button>
         <a href="/admin/proverbs" class="btn btn-outline">Cancel</a>
       </div>
     </form>

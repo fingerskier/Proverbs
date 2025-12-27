@@ -9,18 +9,24 @@
     "db:migrate": "node src/db/migrate.js",
     "db:seed": "node src/db/seed.js"
   },
-  "keywords": ["proverbs", "wisdom", "vector", "embeddings"],
+  "keywords": [
+    "proverbs",
+    "wisdom",
+    "vector",
+    "embeddings"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "connect-pg-simple": "^9.0.1",
+    "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "express-session": "^1.17.3",
+    "openai": "^6.15.0",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
     "pg": "^8.11.3",
-    "pgvector": "^0.1.8",
-    "dotenv": "^16.3.1",
-    "connect-pg-simple": "^9.0.1"
+    "pgvector": "^0.1.8"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
